@@ -1,6 +1,9 @@
 import { useState, useRef } from 'react';
-import { Fingerprint, Upload, Mic, Play, Pause, Loader2, CheckCircle, AlertCircle } from 'lucide-react';
+import { Fingerprint, Upload, Mic, Play, Pause, Loader2, CheckCircle, AlertCircle, Zap } from 'lucide-react';
 import NeonCard from '../NeonCard';
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
 type Stage = 'upload' | 'analyzing' | 'ready' | 'generating' | 'done';
 
@@ -11,24 +14,66 @@ export default function VoiceClone() {
   const [playing, setPlaying] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [voiceId, setVoiceId] = useState<string | null>(null);
+  const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [generatingText, setGeneratingText] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
-  const handleFile = (file: File) => {
-    if (!file.type.startsWith('audio/')) return;
+  const handleFile = async (file: File) => {
+    if (!file.type.startsWith('audio/')) {
+      setError('कृपया एक ऑडियो फाइल चुनें');
+      return;
+    }
+
     setFileName(file.name);
     setStage('analyzing');
     setAnalysisProgress(0);
+    setError(null);
 
-    const interval = setInterval(() => {
+    const progressInterval = setInterval(() => {
       setAnalysisProgress(p => {
-        if (p >= 100) {
-          clearInterval(interval);
-          setStage('ready');
-          return 100;
+        if (p >= 95) {
+          clearInterval(progressInterval);
+          return 95;
         }
-        return p + Math.random() * 12;
+        return p + Math.random() * 8;
       });
     }, 200);
+
+    try {
+      const formData = new FormData();
+      formData.append('audio', file);
+      formData.append('name', `Clone-${Date.now()}`);
+      formData.append('description', 'AI voice clone from uploaded audio');
+
+      const res = await fetch(
+        `${SUPABASE_URL}/functions/v1/voice-clone?action=create-voice`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          },
+          body: formData,
+        }
+      );
+
+      const data = await res.json();
+
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? 'Voice cloning failed');
+      }
+
+      clearInterval(progressInterval);
+      setAnalysisProgress(100);
+      setVoiceId(data.voiceId);
+      setStage('ready');
+    } catch (err) {
+      clearInterval(progressInterval);
+      setError(err instanceof Error ? err.message : 'कुछ गलत हो गया');
+      setStage('upload');
+    }
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -39,35 +84,58 @@ export default function VoiceClone() {
   };
 
   const generateCloned = async () => {
-    if (!ttsText.trim()) return;
+    if (!ttsText.trim() || !voiceId) return;
+
     setStage('generating');
+    setGeneratingText(ttsText);
+    setError(null);
 
-    await new Promise(r => setTimeout(r, 2500));
+    try {
+      const res = await fetch(
+        `${SUPABASE_URL}/functions/v1/voice-clone?action=generate-speech`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: ttsText,
+            voiceId,
+          }),
+        }
+      );
 
-    const utterance = new SpeechSynthesisUtterance(ttsText);
-    utterance.lang = 'hi-IN';
-    utterance.pitch = 0.9 + Math.random() * 0.3;
-    utterance.rate = 0.9;
-    utterance.onend = () => setPlaying(false);
-    window.speechSynthesis.speak(utterance);
+      const data = await res.json();
 
-    setStage('done');
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? 'Speech generation failed');
+      }
+
+      setAudioDataUrl(data.audio);
+      setStage('done');
+
+      if (audioRef.current && data.audio) {
+        audioRef.current.src = data.audio;
+        audioRef.current.play();
+        setPlaying(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Speech generation error');
+      setStage('ready');
+    }
   };
 
   const playPreview = () => {
+    if (!audioRef.current) return;
+
     if (playing) {
-      window.speechSynthesis.cancel();
+      audioRef.current.pause();
       setPlaying(false);
-      return;
+    } else {
+      audioRef.current.play();
+      setPlaying(true);
     }
-    if (!ttsText.trim()) return;
-    const utterance = new SpeechSynthesisUtterance(ttsText);
-    utterance.lang = 'hi-IN';
-    utterance.pitch = 0.9;
-    utterance.rate = 0.9;
-    utterance.onend = () => setPlaying(false);
-    window.speechSynthesis.speak(utterance);
-    setPlaying(true);
   };
 
   const reset = () => {
@@ -76,12 +144,24 @@ export default function VoiceClone() {
     setTtsText('');
     setPlaying(false);
     setAnalysisProgress(0);
-    window.speechSynthesis.cancel();
+    setVoiceId(null);
+    setAudioDataUrl(null);
+    setError(null);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = '';
+    }
   };
 
   return (
-    <NeonCard title="AI वॉयस क्लोन" subtitle="10 सेकंड में आवाज़ क्लोन करें" icon={Fingerprint} iconColor="#ffe600">
+    <NeonCard title="AI वॉयस क्लोन" subtitle="ElevenLabs से उच्च-गुणवत्ता वाली आवाज़ क्लोनिंग" icon={Fingerprint} iconColor="#ffe600">
       <div className="space-y-4">
+        <audio
+          ref={audioRef}
+          onEnded={() => setPlaying(false)}
+          className="hidden"
+        />
+
         {stage === 'upload' && (
           <div
             onDragOver={e => { e.preventDefault(); setDragOver(true); }}
@@ -124,7 +204,7 @@ export default function VoiceClone() {
                 </div>
               </div>
             </div>
-            <p className="font-semibold text-white/80 text-sm">आवाज़ का विश्लेषण हो रहा है...</p>
+            <p className="font-semibold text-white/80 text-sm">ElevenLabs में आवाज़ का विश्लेषण हो रहा है...</p>
             <p className="text-xs text-white/40 mt-1">{fileName}</p>
             <div className="mt-3 h-1.5 bg-midnight-200 rounded-full overflow-hidden">
               <div
@@ -153,6 +233,13 @@ export default function VoiceClone() {
           </div>
         )}
 
+        {error && (
+          <div className="rounded-xl p-3 flex items-start gap-3" style={{ background: 'rgba(255,45,120,0.08)', border: '1px solid rgba(255,45,120,0.3)' }}>
+            <AlertCircle size={16} style={{ color: '#ff2d78' }} className="flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-white/70">{error}</p>
+          </div>
+        )}
+
         {(stage === 'ready' || stage === 'generating' || stage === 'done') && (
           <div>
             <label className="block text-sm font-medium text-white/70 mb-2">क्लोन्ड वॉयस में बोलवाएं</label>
@@ -173,8 +260,8 @@ export default function VoiceClone() {
             className="w-full py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 disabled:opacity-50 transition-all"
             style={{ background: 'linear-gradient(135deg, #cc9900, #ffe600)', color: '#0f051d' }}
           >
-            <Mic size={18} />
-            क्लोन्ड वॉयस जेनरेट करें
+            <Zap size={18} />
+            उच्च-गुणवत्ता वॉयस जेनरेट करें
           </button>
         )}
 
@@ -185,7 +272,7 @@ export default function VoiceClone() {
             style={{ background: 'linear-gradient(135deg, #cc9900, #ffe600)', color: '#0f051d' }}
           >
             <Loader2 size={18} className="animate-spin" />
-            क्लोन्ड ऑडियो बन रहा है...
+            ElevenLabs में ऑडियो बन रहा है...
           </button>
         )}
 
@@ -218,12 +305,11 @@ export default function VoiceClone() {
               </div>
             </div>
             <div className="flex items-center gap-2 text-xs text-white/50">
-              <AlertCircle size={12} style={{ color: '#ffe600' }} />
-              <span>फुल AI क्लोनिंग के लिए ElevenLabs API इंटीग्रेशन आवश्यक है</span>
+              <Zap size={12} style={{ color: '#ffe600' }} />
+              <span>Stability: 0.5 | Similarity Boost: 0.75 — उच्च-गुणवत्ता क्लोनिंग</span>
             </div>
             <button
-              onClick={generateCloned}
-              disabled={!ttsText.trim()}
+              onClick={() => setStage('ready')}
               className="w-full py-2 rounded-lg text-xs font-medium transition-all hover:opacity-80"
               style={{ background: 'rgba(255,230,0,0.15)', color: '#ffe600', border: '1px solid rgba(255,230,0,0.3)' }}
             >
