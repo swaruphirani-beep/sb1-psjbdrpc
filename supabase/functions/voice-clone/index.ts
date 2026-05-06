@@ -9,18 +9,10 @@ const corsHeaders = {
 const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY");
 const ELEVENLABS_URL = "https://api.elevenlabs.io/v1";
 
-interface VoiceCloneRequest {
-  text: string;
-  voiceId: string;
-  name?: string;
-  description?: string;
-}
-
-interface CreateVoiceRequest {
+interface InstantVoiceCloneRequest {
   audioFile: Uint8Array;
   fileName: string;
-  name: string;
-  description?: string;
+  voiceName: string;
 }
 
 interface TextToSpeechRequest {
@@ -28,31 +20,38 @@ interface TextToSpeechRequest {
   voiceId: string;
 }
 
-// Create a cloned voice from uploaded audio file
-async function createClonedVoice(req: CreateVoiceRequest): Promise<string> {
+interface DeleteVoiceRequest {
+  voiceId: string;
+}
+
+// Instant Voice Cloning - create voice from audio file
+async function instantVoiceClone(req: InstantVoiceCloneRequest): Promise<string> {
   const formData = new FormData();
-  formData.append("name", req.name);
-  formData.append("description", req.description || "AI cloned voice");
+  formData.append("name", req.voiceName);
   formData.append("files", new Blob([req.audioFile], { type: "audio/mpeg" }), req.fileName);
 
   const res = await fetch(`${ELEVENLABS_URL}/voices/add`, {
     method: "POST",
     headers: {
-      xi_api_key: ELEVENLABS_API_KEY || "",
+      "xi-api-key": ELEVENLABS_API_KEY || "",
     },
     body: formData,
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(`Failed to create voice: ${JSON.stringify(err)}`);
+    throw new Error(`Instant Voice Clone failed: ${JSON.stringify(err)}`);
   }
 
-  const data = await res.json();
+  const data = await res.json() as { voice_id?: string };
+  if (!data.voice_id) {
+    throw new Error("No voice_id returned from ElevenLabs");
+  }
+
   return data.voice_id;
 }
 
-// Generate speech using cloned voice
+// Text-to-Speech with cloned voice
 async function generateSpeech(text: string, voiceId: string): Promise<Uint8Array> {
   const res = await fetch(`${ELEVENLABS_URL}/text-to-speech/${voiceId}`, {
     method: "POST",
@@ -64,21 +63,21 @@ async function generateSpeech(text: string, voiceId: string): Promise<Uint8Array
       text,
       model_id: "eleven_monolingual_v1",
       voice_settings: {
-        stability: 0.5, // High stability for consistent quality
-        similarity_boost: 0.75, // High similarity boost for natural voice matching
+        stability: 0.5,
+        similarity_boost: 0.8,
       },
     }),
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(`TTS generation failed: ${JSON.stringify(err)}`);
+    const err = await res.text();
+    throw new Error(`TTS generation failed: ${err}`);
   }
 
   return new Uint8Array(await res.arrayBuffer());
 }
 
-// Delete a cloned voice
+// Delete voice clone
 async function deleteVoice(voiceId: string): Promise<void> {
   const res = await fetch(`${ELEVENLABS_URL}/voices/${voiceId}`, {
     method: "DELETE",
@@ -100,7 +99,7 @@ Deno.serve(async (req: Request) => {
   try {
     if (!ELEVENLABS_API_KEY) {
       return new Response(
-        JSON.stringify({ error: "ELEVENLABS_API_KEY is not configured" }),
+        JSON.stringify({ error: "ELEVENLABS_API_KEY not configured" }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -108,32 +107,30 @@ Deno.serve(async (req: Request) => {
     const url = new URL(req.url);
     const action = url.searchParams.get("action");
 
-    if (req.method === "POST" && action === "create-voice") {
+    if (req.method === "POST" && action === "clone") {
       const formData = await req.formData();
       const audioFile = formData.get("audio");
-      const name = formData.get("name") as string;
-      const description = formData.get("description") as string | null;
+      const voiceName = formData.get("voiceName") as string;
 
       if (!audioFile || !(audioFile instanceof File)) {
         return new Response(
-          JSON.stringify({ error: "Audio file is required" }),
+          JSON.stringify({ error: "Audio file required" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
-      if (!name?.trim()) {
+      if (!voiceName?.trim()) {
         return new Response(
-          JSON.stringify({ error: "Voice name is required" }),
+          JSON.stringify({ error: "Voice name required" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
       const audioBuffer = await audioFile.arrayBuffer();
-      const voiceId = await createClonedVoice({
+      const voiceId = await instantVoiceClone({
         audioFile: new Uint8Array(audioBuffer),
         fileName: audioFile.name,
-        name,
-        description: description || undefined,
+        voiceName,
       });
 
       return new Response(
@@ -142,19 +139,19 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (req.method === "POST" && action === "generate-speech") {
+    if (req.method === "POST" && action === "synthesize") {
       const { text, voiceId } = (await req.json()) as TextToSpeechRequest;
 
       if (!text?.trim()) {
         return new Response(
-          JSON.stringify({ error: "Text is required" }),
+          JSON.stringify({ error: "Text required" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
 
       if (!voiceId?.trim()) {
         return new Response(
-          JSON.stringify({ error: "Voice ID is required" }),
+          JSON.stringify({ error: "Voice ID required" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
@@ -168,12 +165,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (req.method === "DELETE" && action === "delete-voice") {
-      const { voiceId } = (await req.json()) as { voiceId: string };
+    if (req.method === "DELETE" && action === "cleanup") {
+      const { voiceId } = (await req.json()) as DeleteVoiceRequest;
 
       if (!voiceId?.trim()) {
         return new Response(
-          JSON.stringify({ error: "Voice ID is required" }),
+          JSON.stringify({ error: "Voice ID required" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
